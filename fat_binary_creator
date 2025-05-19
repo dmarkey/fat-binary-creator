@@ -1,0 +1,248 @@
+#!/bin/bash
+
+# Self-contained Binary Creator Script
+# This script creates a single executable file that contains the binary and all its dependencies,
+# attempts to use the bundled dynamic linker/loader, implements caching for faster subsequent runs,
+# suppresses runtime output for a cleaner execution experience, and validates the input file type.
+
+# Check if a binary path is provided
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <path-to-binary>"
+    echo "Example: $0 /usr/bin/ls"
+    exit 1
+fi
+
+BINARY_PATH="$1"
+BINARY_NAME=$(basename "$BINARY_PATH")
+OUTPUT_BINARY="${BINARY_NAME}_standalone"
+TEMP_DIR="$(mktemp -d)"
+
+# Check if the binary exists
+if [ ! -f "$BINARY_PATH" ]; then
+    echo "Error: Binary $BINARY_PATH does not exist."
+    rm -rf "${TEMP_DIR}" # Clean up temp dir on error
+    exit 1
+fi
+
+# Check if binary is nominally executable (permission-wise)
+if [ ! -x "$BINARY_PATH" ]; then
+    echo "Error: Binary $BINARY_PATH does not have execute permissions."
+    rm -rf "${TEMP_DIR}"
+    exit 1
+fi
+
+### ADDED: Check if the input file is an ELF executable ###
+MIME_TYPE=$(file -b --mime-type "$BINARY_PATH")
+# Common MIME types for ELF executables include application/x-executable (dynamically linked)
+# and application/x-pie-executable (Position Independent Executable).
+# Statically linked executables might also fall under application/x-executable.
+if [[ "$MIME_TYPE" != "application/x-executable" && "$MIME_TYPE" != "application/x-pie-executable" ]]; then
+    echo "Error: The provided file '$BINARY_PATH' is not a recognized ELF executable."
+    echo "Reported MIME type: $MIME_TYPE"
+    echo "This script is designed to package compiled ELF binaries (dynamic or static)."
+    echo "If it's a script, it cannot be processed by this tool."
+    rm -rf "${TEMP_DIR}"
+    exit 1
+fi
+# If ldd still says "not a dynamic executable" after this check, it's likely a static ELF binary, which is fine.
+
+# Create temporary directory structure
+echo "Creating temporary directory structure..."
+mkdir -p "${TEMP_DIR}/bin"
+mkdir -p "${TEMP_DIR}/lib"
+
+# Copy the binary itself
+echo "Copying binary $BINARY_PATH to package..."
+cp "$BINARY_PATH" "${TEMP_DIR}/bin/"
+
+echo "Analyzing dependencies for $BINARY_PATH..."
+LDD_OUTPUT=$(ldd "$BINARY_PATH" 2>&1) # Capture ldd output, including stderr
+
+# Check if ldd indicated it's not a dynamic executable (could be static or error)
+if echo "$LDD_OUTPUT" | grep -q "not a dynamic executable"; then
+    echo "Info: '$BINARY_PATH' is not a dynamic executable (likely static or ldd error for valid static)."
+    echo "No dynamic libraries will be bundled. Proceeding with packaging the binary itself."
+    # No need to parse ldd output for libraries in this case
+else
+    # Get all libraries from ldd output and copy them
+    echo "$LDD_OUTPUT" | grep "=>" | awk '{print $3}' | sort | uniq | while read -r lib; do
+        # Skip virtual libraries like linux-vdso.so
+        if [[ -f "$lib" ]]; then
+            echo "Copying library $lib"
+            cp "$lib" "${TEMP_DIR}/lib/"
+        else
+            echo "Skipping $lib (not a file or a virtual library)"
+        fi
+    done
+fi
+
+
+LOADER_BASENAME=""
+# Try to find loader path even if "not a dynamic executable" was reported,
+# as ldd might still list the interpreter for static PIE executables or certain configurations.
+# However, for truly static, non-PIE, there will be no loader.
+LOADER_PATH_FROM_LDD=$(echo "$LDD_OUTPUT" | grep -oP '/[^ ]*ld-linux[^ ]*\.so[^ ]*' | head -n 1)
+
+if [[ -n "$LOADER_PATH_FROM_LDD" && -f "$LOADER_PATH_FROM_LDD" ]]; then
+    echo "Found loader/interpreter: $LOADER_PATH_FROM_LDD"
+    echo "Copying loader $LOADER_PATH_FROM_LDD to package..."
+    cp "$LOADER_PATH_FROM_LDD" "${TEMP_DIR}/lib/"
+    LOADER_BASENAME=$(basename "$LOADER_PATH_FROM_LDD")
+    echo "Bundled loader basename will be: $LOADER_BASENAME"
+else
+    if ! echo "$LDD_OUTPUT" | grep -q "not a dynamic executable"; then
+        # Only show warning if it wasn't already identified as non-dynamic
+        echo "Warning: Interpreter/loader (ld-linux) not found for $BINARY_PATH or it's not a regular file."
+    else
+        echo "Info: No loader/interpreter found (expected for static non-PIE binaries)."
+    fi
+fi
+
+# Create archive of the binaries and libraries
+echo "Creating archive of binaries and libraries..."
+ARCHIVE_FILE="${TEMP_DIR}/archive.tar.gz"
+tar -C "${TEMP_DIR}" -czf "$ARCHIVE_FILE" bin lib
+
+ARCHIVE_HASH=$(sha256sum "$ARCHIVE_FILE" | awk '{print $1}')
+if [ -z "$ARCHIVE_HASH" ]; then
+    echo "Error: Failed to calculate hash of the archive."
+    rm -rf "${TEMP_DIR}"
+    exit 1
+fi
+echo "Archive hash for caching: $ARCHIVE_HASH"
+
+# Create self-extracting script
+echo "Creating self-extracting executable..."
+cat > "$OUTPUT_BINARY" << EOF
+#!/bin/bash
+# Self-extracting and caching executable (silent operation)
+
+# --- Configuration Placeholders (will be replaced by sed) ---
+BUNDLED_BINARY_NAME="BINARY_NAME_PLACEHOLDER"
+BUNDLED_LOADER_BASENAME="LOADER_NAME_PLACEHOLDER"
+ARCHIVE_CONTENT_HASH="ARCHIVE_HASH_PLACEHOLDER"
+# --- End Configuration Placeholders ---
+
+# Determine where the payload starts
+ARCHIVE_START=\$(awk '/^__ARCHIVE_BELOW__/ {print NR + 1; exit 0; }' "\$0")
+
+# --- Cache Configuration ---
+DEFAULT_CACHE_ROOT="\${HOME}/.cache"
+CACHE_ROOT_DIR="\${XDG_CACHE_HOME:-\$DEFAULT_CACHE_ROOT}/standalone_payloads"
+APP_CACHE_DIR="\${CACHE_ROOT_DIR}/\${BUNDLED_BINARY_NAME}-\${ARCHIVE_CONTENT_HASH}"
+TARGET_BINARY_IN_CACHE="\${APP_CACHE_DIR}/bin/\${BUNDLED_BINARY_NAME}"
+LOADER_IN_CACHE="\${APP_CACHE_DIR}/lib/\${BUNDLED_LOADER_BASENAME}"
+
+TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR=""
+
+cleanup() {
+    if [ -n "\$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR" ] && [ -d "\$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR" ]; then
+        # echo "Cleaning up temporary extraction directory: \$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR" # Suppressed
+        rm -rf "\$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR"
+    fi
+}
+trap cleanup EXIT
+
+EXTRACT_DIR=""
+cache_is_valid=false
+
+if [ -f "\$TARGET_BINARY_IN_CACHE" ] && [ -x "\$TARGET_BINARY_IN_CACHE" ]; then
+    if [ -n "\$BUNDLED_LOADER_BASENAME" ]; then
+        if [ -f "\$LOADER_IN_CACHE" ]; then
+            cache_is_valid=true
+        else
+            # echo "Cache found for binary, but expected loader \$BUNDLED_LOADER_BASENAME is missing in \$LOADER_IN_CACHE." # Suppressed, error implied if it fails later
+            cache_is_valid=false
+        fi
+    else # No loader expected (e.g. static binary)
+        cache_is_valid=true
+    fi
+fi
+
+if \$cache_is_valid; then
+    # echo "Using cached application from \$APP_CACHE_DIR" # Suppressed
+    EXTRACT_DIR="\$APP_CACHE_DIR"
+else
+    # echo "Valid cache not found. Extracting application to cache: \$APP_CACHE_DIR" # Suppressed
+    TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR=\$(mktemp -d)
+    if [ -z "\$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR" ]; then
+        echo "Error: Failed to create temporary directory for extraction." >&2 # Error messages to stderr
+        exit 1
+    fi
+
+    # echo "Extracting bundled files to \$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR..." # Suppressed
+    if tail -n +\$ARCHIVE_START "\$0" | tar -xzf - -C "\$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR"; then
+        # echo "Extraction successful. Populating cache at \$APP_CACHE_DIR..." # Suppressed
+        rm -rf "\$APP_CACHE_DIR"
+        mkdir -p "\$(dirname "\$APP_CACHE_DIR")"
+
+        if mv "\$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR" "\$APP_CACHE_DIR"; then
+            # echo "Successfully cached to \$APP_CACHE_DIR" # Suppressed
+            EXTRACT_DIR="\$APP_CACHE_DIR"
+            TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR=""
+        else
+            echo "Error: Failed to move extracted files from temporary location to cache \$APP_CACHE_DIR." >&2
+            echo "The application might not run correctly. Temporary files are in \$TEMP_EXTRACT_FOR_CACHE_POPULATION_DIR" >&2
+            exit 1
+        fi
+    else
+        echo "Error: Failed to extract archive content." >&2
+        exit 1
+    fi
+fi
+
+if [ -z "\$EXTRACT_DIR" ]; then
+    echo "Error: Extraction directory was not set. Cannot run the application." >&2
+    exit 1
+fi
+
+export LD_LIBRARY_PATH="\$EXTRACT_DIR/lib:\$LD_LIBRARY_PATH"
+
+TARGET_BINARY_PATH="\$EXTRACT_DIR/bin/\$BUNDLED_BINARY_NAME"
+LOADER_PATH_IN_BUNDLE="\$EXTRACT_DIR/lib/\$BUNDLED_LOADER_BASENAME"
+
+# echo "Running executable: \$TARGET_BINARY_PATH" # Suppressed
+
+if [ -n "\$BUNDLED_LOADER_BASENAME" ] && [ -f "\$LOADER_PATH_IN_BUNDLE" ] && [ -x "\$LOADER_PATH_IN_BUNDLE" ]; then
+    # echo "Attempting to run using bundled loader: \$LOADER_PATH_IN_BUNDLE" # Suppressed
+    exec "\$LOADER_PATH_IN_BUNDLE" --library-path "\$EXTRACT_DIR/lib" "\$TARGET_BINARY_PATH" "\$@"
+else
+    # This branch will also be taken for static executables where BUNDLED_LOADER_BASENAME is empty
+    if [ -n "\$BUNDLED_LOADER_BASENAME" ]; then # Only print warning if a loader was expected but not found/usable
+        # echo "Warning: Bundled loader '\$BUNDLED_LOADER_BASENAME' specified but not found or not executable at '\$LOADER_PATH_IN_BUNDLE'." >&2
+        : # No-op, effectively suppressing the warning
+    fi
+    # echo "Attempting direct execution of \$TARGET_BINARY_PATH (will use system loader if binary is dynamic, or run directly if static)" # Suppressed
+    if [ -x "\$TARGET_BINARY_PATH" ]; then
+        exec "\$TARGET_BINARY_PATH" "\$@"
+    else
+        echo "Error: Target binary \$TARGET_BINARY_PATH is not executable in \$EXTRACT_DIR." >&2
+        exit 1
+    fi
+fi
+
+exit 127
+
+__ARCHIVE_BELOW__
+EOF
+
+# Replace placeholders
+sed -i "s/BINARY_NAME_PLACEHOLDER/$BINARY_NAME/g" "$OUTPUT_BINARY"
+sed -i "s/LOADER_NAME_PLACEHOLDER/$LOADER_BASENAME/g" "$OUTPUT_BINARY"
+sed -i "s/ARCHIVE_HASH_PLACEHOLDER/$ARCHIVE_HASH/g" "$OUTPUT_BINARY"
+
+# Append binary archive to the script
+cat "$ARCHIVE_FILE" >> "$OUTPUT_BINARY"
+
+# Make the output file executable
+chmod +x "$OUTPUT_BINARY"
+
+# Clean up main packaging temporary directory
+echo "Cleaning up temporary packaging directory: ${TEMP_DIR}..."
+rm -rf "${TEMP_DIR}"
+
+echo ""
+echo "Done! Self-contained executable has been created as $OUTPUT_BINARY"
+echo "It will cache extracted files and run silently (errors will still be shown)."
+echo "To use, simply run: ./$OUTPUT_BINARY"
+
