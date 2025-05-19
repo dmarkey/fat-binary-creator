@@ -67,12 +67,23 @@ psql (PostgreSQL) 17.4
 
 Installation of `qemu-user-static` and `binfmt-support` (or distribution-specific equivalents) is generally sufficient.
 
+## 🚧 Limitations
+
+*   **Binary Dependencies Only:** This tool focuses on packaging the specified executable and its direct shared library dependencies (as identified by `ldd`). It does **not** automatically include other types of runtime dependencies such as:
+    *   Configuration files
+    *   Data files or assets
+    *   Helper scripts or other executables that the main binary might call
+    *   Standard libraries for interpreted languages (e.g., it won't package the Python standard library if you package a Python interpreter).
+    Users are responsible for ensuring these additional resources are available on the target system if required.
+*   **Assumes `ldd` Accuracy:** The reliability of dependency detection depends on the output of `ldd`.
+
 ## 💡 Potential Enhancements
 
 *   Option to specify the QEMU emulator path.
 *   Improved error handling and reporting.
 *   Configurable cache directory location.
 *   Exploration of alternative packaging formats.
+*   Option to include additional user-specified files or directories in the package.
 
 ## ⚠️ Disclaimer
 
